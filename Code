@@ -350,9 +350,9 @@ def main_pipeline():
 
     final_cands_list = []
     df_final['Type'] = 'Other'
-    TARGET_PER_CLUSTER = 20
+    TARGET_PER_CLUSTER = 10
     N_CENTER = 10
-    N_EDGE = 10
+    N_EDGE = 0
 
     for c in range(n_final_k):
         cluster_indices = df_final[df_final['Cluster'] == c].index
