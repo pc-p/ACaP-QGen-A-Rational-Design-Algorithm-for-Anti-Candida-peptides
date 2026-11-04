@@ -1,0 +1,916 @@
+import os
+import shutil
+import subprocess
+import tempfile
+import re
+import numpy as np
+import pandas as pd
+import joblib
+import matplotlib.pyplot as plt
+import logging
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, explained_variance_score
+from catboost import CatBoostRegressor
+from sklearn.ensemble import RandomForestRegressor, VotingRegressor
+from sklearn.utils import Bunch
+from sklearn.base import clone
+import warnings
+import time
+import optuna
+from scipy.stats import pearsonr, spearmanr
+from pathlib import Path
+from logging.handlers import RotatingFileHandler
+
+# 使用 Kaggle Notebook 前，请先在单独的代码单元安装 CD-HIT：
+# !apt-get update -qq && apt-get install -y -qq cd-hit
+# 也可设置环境变量 CDHIT_BIN 指向已安装的 cd-hit 可执行文件。
+# 本脚本使用真实的 CD-HIT 程序；找不到时会报错，不会假装执行去冗余。
+
+CDHIT_THRESHOLD = 0.90
+CDHIT_WORD_SIZE = 5
+CDHIT_MIN_DISCARD_LENGTH = 4  # 原序列清洗允许最短 5 aa，避免默认 -l 10 丢弃短肽
+CDHIT_COVERAGE = 0.90          # 双向覆盖限制，避免仅共享短片段的肽被误聚类
+
+# 抑制特定环境警告以保持输出整洁
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+# 初始化输出目录与日志记录系统
+OUTPUT_DIR = Path('/kaggle/working/MIC_prediction_outputs_ensemble_cdhit90')
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+fh = RotatingFileHandler(OUTPUT_DIR / 'training.log', maxBytes=5*1024*1024, backupCount=5)
+fh.setLevel(logging.INFO)
+fh.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s:%(message)s'))
+logger.addHandler(fh)
+
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+ch.setFormatter(logging.Formatter('%(levelname)s:%(message)s'))
+logger.addHandler(ch)
+
+try:
+    logger.info(f"tqdm version: {tqdm.__version__}")
+    print(f"tqdm version: {tqdm.__version__}")
+except AttributeError:
+    logger.info("tqdm version: Not available")
+    print("tqdm version: Not available")
+
+# 定义数据与特征读取的全局绝对路径（修复路径拼接覆写异常）
+DATA_PATH = Path('/kaggle/input/datasets/niuyufeng/esmesm2/2246-F.CSV')   
+AAINDEX_PATH = Path('/kaggle/input/datasets/niuyufeng/esmesm7/氨基酸特征')
+
+# 特征提取类定义（已移除三肽高维稀疏特征）
+class SequenceFeatureExtractor:
+    def __init__(self):
+        self.aa_groups = {
+            'hydrophobic': 'AILMFWYV',
+            'polar': 'QNSTC',
+            'charged': 'KRHDE',
+            'small': 'GPASC',
+            'aromatic': 'FYW'
+        }
+
+    def get_aa_composition(self, sequence):
+        length = len(sequence)
+        if length == 0:
+            return [0] * 20
+        aa_counts = {aa: sequence.count(aa) / length for aa in 'ACDEFGHIKLMNPQRSTVWY'}
+        return [aa_counts.get(aa, 0) for aa in 'ACDEFGHIKLMNPQRSTVWY']
+
+    def get_dipeptide_composition(self, sequence):
+        length = len(sequence) - 1
+        if length <= 0:
+            return [0] * (20 * 20)
+        dipeptides = [sequence[i:i+2] for i in range(length)]
+        dipeptide_counts = {}
+        for dp in dipeptides:
+            dipeptide_counts[dp] = dipeptide_counts.get(dp, 0) + 1
+        return [dipeptide_counts.get(aa1 + aa2, 0) / length for aa1 in 'ACDEFGHIKLMNPQRSTVWY' for aa2 in 'ACDEFGHIKLMNPQRSTVWY']
+
+    def get_group_composition(self, sequence):
+        length = len(sequence)
+        if length == 0:
+            return [0] * 5
+        group_counts = {group: sum(1 for aa in sequence if aa in aas) / length for group, aas in self.aa_groups.items()}
+        return [group_counts.get(group, 0) for group in ['hydrophobic', 'polar', 'charged', 'small', 'aromatic']]
+
+    def extract_all_features(self, sequence):
+        return (
+            self.get_aa_composition(sequence) +
+            self.get_dipeptide_composition(sequence) +
+            self.get_group_composition(sequence) +
+            [len(sequence)]
+        )
+
+# 自适应 AAindex 特征加载器（兼容泛化对象存储结构）
+def load_aaindex_features(path):
+    aa_features_dict = {}
+    path = Path(path)
+    
+    # 构建兼容大小写后缀的文件迭代器
+    pkl_files = list(path.glob('*.pkl')) + list(path.glob('*.PKL'))
+    
+    if not pkl_files:
+        logger.error(f"严重警告：路径 {path} 下未检索到任何 .pkl 格式的理化特征文件。请核对挂载路径。")
+        print(f"CRITICAL WARNING: No .pkl files found in {path}.")
+        return aa_features_dict
+
+    for file in pkl_files:
+        try:
+            features = joblib.load(file)
+            valid_features = {}
+            
+            # 策略化降解：将 Pandas 数据结构泛化为标准 Python 字典
+            if isinstance(features, pd.Series):
+                features = features.to_dict()
+            elif isinstance(features, pd.DataFrame):
+                # 提取首列特征并转换为字典
+                features = features.iloc[:, 0].to_dict()
+            elif hasattr(features, 'item') and hasattr(features, 'shape') and features.shape == ():
+                # 兼容 NumPy 标量字典
+                features = features.item()
+                
+            # 执行特征空间投影与强制数值转换
+            if isinstance(features, dict):
+                for aa, value in features.items():
+                    if aa in 'ACDEFGHIKLMNPQRSTVWY':
+                        try:
+                            # 强制转换为原生浮点型，规避 NumPy 类型不兼容障碍
+                            valid_features[aa] = float(value)
+                        except (ValueError, TypeError):
+                            continue
+                            
+            if valid_features:
+                aa_features_dict[file.stem] = valid_features
+            else:
+                logger.warning(f"特征解析异常：文件 {file.name} 未能输出有效的氨基酸映射规则。")
+                
+        except Exception as e:
+            logger.error(f"IO 阻塞或解析崩溃 {file.name}: {e}", exc_info=True)
+            
+    logger.info(f"成功挂载并解析 {len(aa_features_dict)} 个 AAindex 独立特征簇。")
+    print(f"Successfully loaded {len(aa_features_dict)} AAindex features.")
+    
+    return aa_features_dict
+
+# 执行高维序列特征与 AAindex 特征的级联映射
+def compute_sequence_features(seq, aa_features_dict, feature_extractor):
+    sequence_features = feature_extractor.extract_all_features(seq)
+    
+    aaindex_features = []
+    sorted_index_names = sorted(aa_features_dict.keys())
+    
+    for index_name in sorted_index_names:
+        prop_dict = aa_features_dict[index_name]
+        valid_values = [prop_dict[aa] for aa in seq if aa in prop_dict and prop_dict[aa] is not None]
+        
+        if valid_values:
+            seq_prop_mean = np.mean(valid_values)
+        else:
+            seq_prop_mean = 0.0
+        aaindex_features.append(seq_prop_mean)
+        
+    sequence_features.extend(aaindex_features)
+    return sequence_features
+
+# 序列数据标准化清洗
+def clean_sequence(seq, min_length=5, max_length=1000):
+    if not isinstance(seq, str):
+        return np.nan
+    cleaned = re.sub(r'[^ACDEFGHIKLMNPQRSTVWY]', '', seq.upper())
+    if min_length <= len(cleaned) <= max_length:
+        return cleaned
+    return np.nan
+
+# 定义模型性能评估体系
+def evaluate_model(model, X_test, y_test):
+    y_pred = model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+    evs = explained_variance_score(y_test, y_pred)
+    pearson_corr, _ = pearsonr(y_test, y_pred)
+    spearman_corr, _ = spearmanr(y_test, y_pred)
+    metrics = {
+        'Test_MSE': mse,
+        'Test_MAE': mae,
+        'Test_R2': r2,
+        'Test_Explained_Variance': evs,
+        'Pearson_Correlation': pearson_corr,
+        'Spearman_Correlation': spearman_corr
+    }
+    return metrics, y_pred
+
+def plot_regression(y_true, y_pred, model_name, output_dir):
+    plt.figure(figsize=(6,6))
+    plt.scatter(y_true, y_pred, alpha=0.7, label='Predicted Values')
+    min_val = min(np.min(y_true), np.min(y_pred))
+    max_val = max(np.max(y_true), np.max(y_pred))
+    plt.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Ideal Fit')
+    plt.xlabel('True MIC_Standardized')
+    plt.ylabel('Predicted MIC_Standardized')
+    plt.title(f'{model_name}: Predicted vs True Values')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_dir / f'{model_name}_pred_vs_true.png', dpi=300)
+    plt.close()
+
+def plot_residuals(y_true, y_pred, model_name, output_dir):
+    residuals = y_true - y_pred
+    plt.figure(figsize=(6,6))
+    plt.scatter(y_pred, residuals, alpha=0.7)
+    plt.axhline(0, color='r', linestyle='--')
+    plt.xlabel('Predicted MIC_Standardized')
+    plt.ylabel('Residuals')
+    plt.title(f'{model_name}: Residuals Plot')
+    plt.tight_layout()
+    plt.savefig(output_dir / f'{model_name}_residuals.png', dpi=300)
+    plt.close()
+
+def plot_ensemble_mse(train_cv_mse, test_mse, output_dir):
+    """一个集成模型的交叉验证 MSE 与独立测试 MSE，可视化不再比较两个独立模型。"""
+    fig, ax = plt.subplots(figsize=(7, 5))
+    means = [float(np.mean(train_cv_mse)), float(test_mse)]
+    errors = [float(np.std(train_cv_mse)), 0.0]
+    x = np.arange(2)
+    ax.bar(x, means, yerr=errors, capsize=5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(['Train 10-Fold CV', 'Independent Test'])
+    ax.set_ylabel('Mean Squared Error')
+    ax.set_title('CatBoost + Random Forest Ensemble: MSE')
+    fig.tight_layout()
+    fig.savefig(output_dir / 'ensemble_cv_test_mse.png', dpi=300)
+    plt.close(fig)
+
+
+def make_oof_predictions(estimators, X, y, splitter):
+    """仅利用训练集，通过交叉验证为多个回归器生成折外预测。"""
+    predictions = np.full((X.shape[0], len(estimators)), np.nan, dtype=float)
+    for fold_number, (fit_idx, valid_idx) in enumerate(splitter.split(X, y), start=1):
+        logger.info(f'Generating out-of-fold predictions: fold {fold_number}')
+        for model_idx, estimator in enumerate(estimators):
+            current_model = clone(estimator)
+            current_model.fit(X[fit_idx], y[fit_idx])
+            predictions[valid_idx, model_idx] = current_model.predict(X[valid_idx])
+
+    if not np.isfinite(predictions).all():
+        raise ValueError('Failed to generate complete out-of-fold predictions.')
+    return predictions
+
+
+def choose_ensemble_weights(y, oof_predictions, min_weight=0.05):
+    """
+    以训练集 OOF 的 MSE 最小化确定凸组合权重。
+    强制两个基模型均参与预测，每个模型权重至少为 min_weight。
+    测试集不参与权重学习。
+    """
+    cb_pred = oof_predictions[:, 0]
+    rf_pred = oof_predictions[:, 1]
+    delta = cb_pred - rf_pred
+    denominator = float(np.dot(delta, delta))
+    if denominator < 1e-12:
+        cb_weight = 0.5
+    else:
+        cb_weight = float(np.dot(y - rf_pred, delta) / denominator)
+    cb_weight = float(np.clip(cb_weight, min_weight, 1.0 - min_weight))
+    return cb_weight, 1.0 - cb_weight
+
+
+def make_fitted_voting_regressor(fitted_catboost, fitted_random_forest, weights):
+    """
+    将两个已经拟合的模型作为一个 sklearn VotingRegressor 保存。
+    当前 CatBoost 版本在部分新版 sklearn 环境中未实现 __sklearn_tags__，
+    故不调用 VotingRegressor.fit（该方法会重复拟合并触发标签兼容问题），
+    而是安装其所需的 fitted attributes。保存后的对象直接支持 .predict(X)。
+    """
+    ensemble = VotingRegressor(
+        estimators=[
+            ('catboost', fitted_catboost),
+            ('random_forest', fitted_random_forest)
+        ],
+        weights=list(weights)
+    )
+    ensemble.estimators_ = [fitted_catboost, fitted_random_forest]
+    ensemble.named_estimators_ = Bunch(
+        catboost=fitted_catboost,
+        random_forest=fitted_random_forest
+    )
+    return ensemble
+
+
+def aggregate_exact_duplicate_sequences(data):
+    """
+    完全相同的清洗后氨基酸序列：MIC_Standardized 按算术平均合并。
+    不对仅相似的序列取均值；保留复测数量和活性范围供审查。
+    """
+    grouped = (
+        data.groupby('Sequence', as_index=False, sort=False)['MIC_Standardized']
+        .agg(
+            MIC_Standardized='mean',
+            Replicate_Count='size',
+            MIC_Min='min',
+            MIC_Max='max',
+            MIC_SD='std'
+        )
+    )
+    grouped['MIC_SD'] = grouped['MIC_SD'].fillna(0.0)
+    grouped['Length'] = grouped['Sequence'].str.len()
+    return grouped
+
+
+def parse_cdhit_clusters(cluster_file, expected_ids):
+    """严格读取 CD-HIT 的 .clstr 文件：映射每条序列到所属簇及代表序列。"""
+    groups = []
+    cluster_id = None
+    seen_ids = set()
+    reps_by_cluster = {}
+
+    for raw_line in cluster_file.read_text(encoding='utf-8').splitlines():
+        line = raw_line.strip()
+        if line.startswith('>Cluster '):
+            cluster_id = int(line.split()[-1])
+            continue
+        if not line:
+            continue
+        if cluster_id is None:
+            raise ValueError('CD-HIT .clstr contains a member before cluster header.')
+
+        member_match = re.search(r'>(seq\d+)\.\.\.', line)
+        if member_match is None:
+            raise ValueError(f'Unexpected CD-HIT .clstr member line: {line}')
+        member_id = member_match.group(1)
+        if member_id in seen_ids:
+            raise ValueError(f'Duplicate member ID in CD-HIT output: {member_id}')
+        seen_ids.add(member_id)
+
+        is_rep = line.endswith('*')
+        if is_rep:
+            if cluster_id in reps_by_cluster:
+                raise ValueError(f'Multiple representatives in cluster {cluster_id}')
+            reps_by_cluster[cluster_id] = member_id
+
+        groups.append({
+            'Member_ID': member_id,
+            'Cluster_ID': cluster_id,
+            'Is_Representative': is_rep
+        })
+
+    if seen_ids != set(expected_ids):
+        missing = set(expected_ids) - seen_ids
+        unexpected = seen_ids - set(expected_ids)
+        raise ValueError(
+            f'Incomplete CD-HIT cluster mapping: missing={len(missing)}, '
+            f'unexpected={len(unexpected)}.'
+        )
+    clusters = {row['Cluster_ID'] for row in groups}
+    if clusters != set(reps_by_cluster):
+        raise ValueError('CD-HIT output has one or more clusters without a representative.')
+    for item in groups:
+        item['Representative_ID'] = reps_by_cluster[item['Cluster_ID']]
+    return pd.DataFrame(groups)
+
+
+def run_cdhit_90(unique_data, output_dir):
+    """
+    对精确去重后的数据运行蛋白质 CD-HIT：90% identity。
+    .clstr 的代表序列保留其自身的 MIC 均值；近似序列不平均活性。
+    """
+    executable = os.environ.get('CDHIT_BIN', 'cd-hit')
+    resolved = shutil.which(executable)
+    if resolved is None:
+        raise FileNotFoundError(
+            "找不到 CD-HIT 可执行文件。请先在 Kaggle Notebook 单元执行 "
+            "'!apt-get update -qq && apt-get install -y -qq cd-hit'，"
+            "或者设置环境变量 CDHIT_BIN 为 cd-hit 的完整路径。"
+        )
+
+    unique_data = unique_data.reset_index(drop=True).copy()
+    unique_data['Member_ID'] = [
+        f'seq{idx:08d}' for idx in range(len(unique_data))
+    ]
+    expected_ids = unique_data['Member_ID'].tolist()
+    output_dir = Path(output_dir)
+
+    with tempfile.TemporaryDirectory(prefix='mic_cdhit90_') as temp_name:
+        work_dir = Path(temp_name)
+        fasta_in = work_dir / 'unique_peptides.fasta'
+        fasta_out = work_dir / 'cdhit90_representatives.fasta'
+
+        with fasta_in.open('w', encoding='utf-8') as handle:
+            for row in unique_data.itertuples(index=False):
+                handle.write(f'>{row.Member_ID}\n{row.Sequence}\n')
+
+        command = [
+            resolved,
+            '-i', str(fasta_in), '-o', str(fasta_out),
+            '-c', str(CDHIT_THRESHOLD), '-n', str(CDHIT_WORD_SIZE),
+            '-G', '1',
+            '-aL', str(CDHIT_COVERAGE), '-aS', str(CDHIT_COVERAGE),
+            '-l', str(CDHIT_MIN_DISCARD_LENGTH),
+            '-d', '0', '-M', '0', '-T', str(min(os.cpu_count() or 1, 4))
+        ]
+        logger.info('Running CD-HIT 90%%: %s', ' '.join(command))
+        try:
+            outcome = subprocess.run(
+                command, capture_output=True, text=True, check=True
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f'CD-HIT clustering failed (exit={exc.returncode}). '
+                f'stderr: {exc.stderr[-2000:]} '
+                f'stdout: {exc.stdout[-2000:]}'
+            ) from exc
+
+        logger.info('CD-HIT output: %s', outcome.stdout[-1200:])
+        clstr_path = Path(str(fasta_out) + '.clstr')
+        if not fasta_out.is_file() or not clstr_path.is_file():
+            raise FileNotFoundError('CD-HIT did not create representative FASTA and .clstr files.')
+
+        cluster_mapping = parse_cdhit_clusters(clstr_path, expected_ids)
+
+        # 同时核对 FASTA 的代表序列 ID，防止错误解析或短肽被静默过滤。
+        fasta_representatives = set(
+            re.findall(r'^>(\S+)', fasta_out.read_text(encoding='utf-8'), re.M)
+        )
+        clstr_representatives = set(
+            cluster_mapping.loc[
+                cluster_mapping['Is_Representative'], 'Member_ID'
+            ]
+        )
+        if fasta_representatives != clstr_representatives:
+            raise RuntimeError('CD-HIT FASTA and .clstr representative IDs differ.')
+
+    mapping = unique_data.merge(
+        cluster_mapping, how='inner', on='Member_ID', validate='one_to_one'
+    )
+    if len(mapping) != len(unique_data):
+        raise RuntimeError('CD-HIT mapping count does not match unique sequence count.')
+    id_to_sequence = dict(zip(unique_data['Member_ID'], unique_data['Sequence']))
+    mapping['Representative_Sequence'] = mapping['Representative_ID'].map(id_to_sequence)
+
+    # 仅选 CD-HIT 的代表序列，一簇保留一条记录。
+    representative_data = (
+        mapping.loc[mapping['Is_Representative']]
+        .sort_values('Cluster_ID')
+        .copy()
+    )
+    representative_data['Cluster_Size'] = (
+        representative_data['Cluster_ID']
+        .map(mapping.groupby('Cluster_ID').size())
+        .astype(int)
+    )
+    representative_data = representative_data[
+        ['Sequence', 'MIC_Standardized', 'Replicate_Count',
+         'MIC_Min', 'MIC_Max', 'MIC_SD', 'Length', 'Cluster_ID', 'Cluster_Size']
+    ].reset_index(drop=True)
+    mapping = mapping[
+        ['Member_ID', 'Cluster_ID', 'Sequence', 'MIC_Standardized',
+         'Replicate_Count', 'MIC_Min', 'MIC_Max', 'Is_Representative',
+         'Representative_Sequence']
+    ]
+
+    # 记录可复核的去冗余映射和最终建模数据。
+    mapping.to_csv(output_dir / 'cdhit90_cluster_mapping.csv', index=False)
+    representative_data.to_csv(
+        output_dir / 'cdhit90_modeling_dataset.csv', index=False
+    )
+    return representative_data, mapping
+
+
+# 主执行模块
+if __name__ == "__main__":
+    start_total_time = time.time()
+    
+    # 阶段 1：数据读取与预处理
+    logger.info("Reading and preprocessing data...")
+    print("Reading and preprocessing data...")
+    try:
+        data = pd.read_csv(DATA_PATH, sep=',')
+    except Exception as e:
+        logger.error(f"Error reading data: {e}", exc_info=True)
+        print(f"Error reading data: {e}")
+        raise SystemExit(f"Failed to read data: {e}")
+
+    logger.info(f"Dataset shape: {data.shape}")
+    
+    # 先清洗数据，再划分训练/测试；训练集分位数确定目标值截断边界。
+    if 'Sequence' not in data.columns or 'MIC_Standardized' not in data.columns:
+        raise SystemExit("Input CSV must contain 'Sequence' and 'MIC_Standardized'.")
+
+    raw_rows = len(data)
+    data['Sequence'] = data['Sequence'].apply(clean_sequence)
+    data['MIC_Standardized'] = pd.to_numeric(
+        data['MIC_Standardized'], errors='coerce'
+    )
+    data = data.dropna(subset=['Sequence', 'MIC_Standardized']).reset_index(drop=True)
+    data = data[np.isfinite(data['MIC_Standardized'])].reset_index(drop=True)
+    cleaned_rows = len(data)
+    if cleaned_rows == 0:
+        raise ValueError('No valid MIC-labeled peptide sequences remain after cleaning.')
+
+    # 阶段 1A：完全相同序列（清洗后）合并；活性取算术均值。
+    unique_data = aggregate_exact_duplicate_sequences(data)
+    n_exact_unique = len(unique_data)
+    n_replicate_groups = int((unique_data['Replicate_Count'] > 1).sum())
+    n_conflicting_groups = int(
+        ((unique_data['Replicate_Count'] > 1) &
+         (unique_data['MIC_Max'] > unique_data['MIC_Min'])).sum()
+    )
+    logger.info(
+        f'Exact duplicate aggregation: {cleaned_rows} records -> '
+        f'{n_exact_unique} unique sequences; '
+        f'{n_replicate_groups} replicated sequence groups; '
+        f'{n_conflicting_groups} with differing MIC values.'
+    )
+
+    # 阶段 1B：先对全数据按序列聚类，再进行训练/测试划分。
+    # 仅以肽序列做 CD-HIT 去冗余，避免高度相似的序列同时进入两侧。
+    # 相似但不同的序列不合并 MIC；只保留簇代表序列自己的平均 MIC。
+    data, cdhit_mapping = run_cdhit_90(unique_data, OUTPUT_DIR)
+    n_after_cdhit = len(data)
+    n_near_duplicate_removed = n_exact_unique - n_after_cdhit
+    if n_after_cdhit < 15:
+        raise ValueError(
+            f'CD-HIT 0.90 reduced the dataset to {n_after_cdhit} sequences. '
+            'Need at least 15 samples to run the existing 10-fold CV pipeline.'
+        )
+
+    logger.info(
+        f'CD-HIT 0.90: {n_exact_unique} unique sequences -> '
+        f'{n_after_cdhit} representative peptides '
+        f'({n_near_duplicate_removed} near-duplicate sequences removed).'
+    )
+    print(
+        f'Deduplication: raw={raw_rows}, valid={cleaned_rows}, '
+        f'exact_unique={n_exact_unique}, CDHIT90={n_after_cdhit}'
+    )
+
+    # 绘图反映实际参与建模的 CD-HIT 代表序列，不再用去冗余前的数据。
+    plt.figure(figsize=(8, 6))
+    plt.hist(data['MIC_Standardized'], bins=30)
+    plt.title('Distribution of MIC_Standardized')
+    plt.xlabel('MIC_Standardized')
+    plt.ylabel('Count')
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / 'mic_distribution.png', dpi=300)
+    plt.close()
+
+    # 阶段 2：高维特征提取（氨基酸组成与全量 AAindex）
+    logger.info("Extracting sequence features without tripeptides...")
+    print("Extracting sequence features without tripeptides...")
+    feature_extractor = SequenceFeatureExtractor()
+    aa_features_dict = load_aaindex_features(AAINDEX_PATH)
+    
+    try:
+        sequence_features = np.array([
+            compute_sequence_features(seq, aa_features_dict, feature_extractor) for seq in tqdm(data['Sequence'], desc="Computing sequence features")
+        ], dtype=np.float32)
+    except Exception as e:
+        logger.error(f"Error computing sequence features: {e}", exc_info=True)
+        raise SystemExit(f"Failed to compute sequence features: {e}")
+    
+    X_feats = sequence_features
+    logger.info(f"Final feature space shape: {X_feats.shape}")
+    print(f"Final feature space shape: {X_feats.shape}")
+    
+    # 构建准确对齐的特征命名空间（剔除三肽）
+    feature_names = []
+    feature_names.extend([f'AA_{aa}' for aa in 'ACDEFGHIKLMNPQRSTVWY'])
+    feature_names.extend([f'Dipeptide_{aa1}{aa2}' for aa1 in 'ACDEFGHIKLMNPQRSTVWY' for aa2 in 'ACDEFGHIKLMNPQRSTVWY'])
+    feature_names.extend(['Group_hydrophobic', 'Group_polar', 'Group_charged', 'Group_small', 'Group_aromatic'])
+    feature_names.append('Sequence_Length')
+    
+    sorted_aaindex_names = sorted(aa_features_dict.keys())
+    feature_names.extend([f'AAindex_{name}' for name in sorted_aaindex_names])
+    
+    # 保存特征结构以备后续可解释性分析
+    sequence_features_df = pd.DataFrame(X_feats, columns=feature_names)
+    sequence_features_df.to_csv(OUTPUT_DIR / 'sequence_features.csv', index=False)
+    
+    if X_feats.shape[1] != len(feature_names):
+        logger.error(f"Feature count mismatch: X_feats has {X_feats.shape[1]} features, but {len(feature_names)} names provided")
+        raise ValueError("Feature count mismatch between X_feats and feature names")
+
+    # 阶段 3：特征清洗及数据集划分
+    X_feats = np.nan_to_num(X_feats, nan=0.0, posinf=0.0, neginf=0.0)
+    y_raw = data['MIC_Standardized'].to_numpy(dtype=float)
+    indices = np.arange(len(data))
+    train_indices, test_indices = train_test_split(
+        indices, test_size=0.2, random_state=42
+    )
+    X_train_main = X_feats[train_indices]
+    X_test_main = X_feats[test_indices]
+
+    # Winsorization 截断阈值仅从训练集计算，避免使用测试集标签信息。
+    q_low, q_high = np.quantile(y_raw[train_indices], [0.01, 0.99])
+    y = np.clip(y_raw, q_low, q_high)
+    y_train_main = y[train_indices]
+    y_test_main = y[test_indices]
+
+    # 仅在训练数据计算特征与靶值的相关性；只用于报告，不参与特征选择。
+    correlations = {}
+    for i, name in enumerate(feature_names):
+        feat = X_train_main[:, i]
+        if np.std(feat) > 0 and np.std(y_train_main) > 0:
+            correlations[name] = float(pearsonr(feat, y_train_main)[0])
+        else:
+            correlations[name] = 0.0
+
+    correlation_df = pd.DataFrame(
+        list(correlations.items()), columns=['Feature', 'Pearson_Correlation']
+    )
+    correlation_df.to_csv(OUTPUT_DIR / 'feature_correlations.csv', index=False)
+
+    # 阶段 4：分别优化 CatBoost 和随机森林的内部参数
+    catboost_param_grid = {
+        'iterations': [200, 300, 400, 500, 600, 700, 800],
+        'depth': [4, 6, 8, 10],
+        'learning_rate': [0.05, 0.1, 0.2, 0.3],
+        'l2_leaf_reg': [1, 3, 5, 7, 9],
+        'border_count': [32, 64, 128, 254],
+        'grow_policy': ['SymmetricTree', 'Depthwise', 'Lossguide'],
+        'bootstrap_type': ['Poisson'],
+        'subsample': [0.5, 0.6, 0.7, 0.8, 0.9]
+    }
+
+    random_forest_param_grid = {
+        'n_estimators': [200, 300, 400, 500, 700],
+        'max_depth': [None, 8, 12, 20, 30],
+        'min_samples_split': [2, 4, 8, 12],
+        'min_samples_leaf': [1, 2, 4, 6],
+        'max_features': ['sqrt', 0.3, 0.5, 0.8, 1.0],
+        'bootstrap': [True, False]
+    }
+
+    # 与原代码一致，CatBoost 使用 Kaggle GPU；随机森林用 CPU 并行。
+    # 先分别优化基模型，然后优化两者的预测融合权重；最终只有一个集成模型。
+    model_configs = [
+        {
+            'name': 'CatBoost',
+            'estimator': CatBoostRegressor(
+                random_state=42, verbose=0, task_type='GPU', devices='0'
+            ),
+            'param_grid': catboost_param_grid,
+            'n_trials': 200,
+            'timeout': 7200
+        },
+        {
+            'name': 'RandomForest',
+            'estimator': RandomForestRegressor(
+                random_state=42, n_jobs=-1
+            ),
+            'param_grid': random_forest_param_grid,
+            'n_trials': 80,
+            'timeout': 3600
+        }
+    ]
+
+    optuna_cv = KFold(n_splits=5, shuffle=True, random_state=42)
+    evaluation_cv = KFold(n_splits=10, shuffle=True, random_state=42)
+    best_param_sets = {}
+    optimized_estimators = {}
+
+    def cross_validated_mse(estimator, X, targets, splitter):
+        errors = []
+        for fit_idx, valid_idx in splitter.split(X, targets):
+            clone_model = clone(estimator)
+            clone_model.fit(X[fit_idx], targets[fit_idx])
+            predictions = clone_model.predict(X[valid_idx])
+            errors.append(
+                mean_squared_error(targets[valid_idx], predictions)
+            )
+        return np.asarray(errors, dtype=float)
+
+    for config in model_configs:
+        name = config['name']
+        base_estimator = config['estimator']
+        logger.info(f'Optimizing internal model: {name}')
+
+        def objective(trial):
+            param_values = {
+                parameter: trial.suggest_categorical(parameter, options)
+                for parameter, options in config['param_grid'].items()
+            }
+            trial_estimator = clone(base_estimator)
+            trial_estimator.set_params(**param_values)
+            return float(
+                cross_validated_mse(
+                    trial_estimator, X_train_main, y_train_main, optuna_cv
+                ).mean()
+            )
+
+        study = optuna.create_study(
+            direction='minimize',
+            sampler=optuna.samplers.TPESampler(seed=42)
+        )
+        study.optimize(
+            objective,
+            n_trials=config['n_trials'],
+            timeout=config['timeout']
+        )
+
+        best_param_sets[name] = study.best_params
+        optimized_estimators[name] = clone(base_estimator).set_params(
+            **study.best_params
+        )
+        logger.info(f'{name} best params: {study.best_params}')
+
+    catboost_estimator = optimized_estimators['CatBoost']
+    forest_estimator = optimized_estimators['RandomForest']
+
+    # 阶段 5：使用训练集的折外预测 (OOF) 选择集成权重。
+    oof_preds = make_oof_predictions(
+        [catboost_estimator, forest_estimator],
+        X_train_main,
+        y_train_main,
+        optuna_cv
+    )
+    ensemble_weights = choose_ensemble_weights(y_train_main, oof_preds)
+    catboost_weight, forest_weight = ensemble_weights
+
+    logger.info(
+        f'Ensemble weights: CatBoost={catboost_weight:.4f}, '
+        f'RandomForest={forest_weight:.4f}'
+    )
+    print(
+        f'Ensemble weights -> CatBoost: {catboost_weight:.4f}, '
+        f'RandomForest: {forest_weight:.4f}'
+    )
+
+    # 阶段 6：10 折验证，只评价融合后的单一模型。
+    # 该值属于训练集内部诊断；超参数和融合权重由同一训练集决定。
+    # 独立测试集性能才是最终外部验证指标。
+    train_cv_errors = []
+    for train_fold_idx, valid_fold_idx in evaluation_cv.split(
+        X_train_main, y_train_main
+    ):
+        cb_fold = clone(catboost_estimator)
+        rf_fold = clone(forest_estimator)
+        cb_fold.fit(
+            X_train_main[train_fold_idx], y_train_main[train_fold_idx]
+        )
+        rf_fold.fit(
+            X_train_main[train_fold_idx], y_train_main[train_fold_idx]
+        )
+
+        combined_predictions = (
+            catboost_weight * cb_fold.predict(X_train_main[valid_fold_idx])
+            + forest_weight * rf_fold.predict(X_train_main[valid_fold_idx])
+        )
+        train_cv_errors.append(
+            mean_squared_error(
+                y_train_main[valid_fold_idx], combined_predictions
+            )
+        )
+
+    train_cv_errors = np.asarray(train_cv_errors, dtype=float)
+
+    # 阶段 7：训练两个子模型并融合为一个标准 sklearn VotingRegressor。
+    # CatBoost 旧版本与 sklearn 新版标签接口不兼容，先分别 fit，
+    # 再组合到预拟合 VotingRegressor，以保证单一 pkl 可以直接 predict。
+    logger.info('Fitting the final CatBoost + RandomForest ensemble...')
+    trained_catboost = clone(catboost_estimator)
+    trained_forest = clone(forest_estimator)
+    trained_catboost.fit(X_train_main, y_train_main)
+    trained_forest.fit(X_train_main, y_train_main)
+
+    ensemble_model = make_fitted_voting_regressor(
+        trained_catboost, trained_forest, ensemble_weights
+    )
+
+    # 保存特征映射元信息，避免后续预测时 AAindex 的排列顺序发生变化。
+    ensemble_model.feature_names_ = feature_names
+    ensemble_model.aaindex_features_ = aa_features_dict
+    ensemble_model.target_clip_bounds_ = (float(q_low), float(q_high))
+    ensemble_model.cdhit_threshold_ = CDHIT_THRESHOLD
+    ensemble_model.cdhit_alignment_coverage_ = CDHIT_COVERAGE
+    ensemble_model.duplicate_target_aggregation_ = 'mean'
+    ensemble_model.training_sequence_count_ = len(train_indices)
+
+    # 验证 VotingRegressor 的预测与人工加权求和一致。
+    prediction_check = (
+        catboost_weight * trained_catboost.predict(X_test_main)
+        + forest_weight * trained_forest.predict(X_test_main)
+    )
+    if not np.allclose(
+        ensemble_model.predict(X_test_main), prediction_check,
+        atol=1e-7, rtol=1e-7
+    ):
+        raise RuntimeError('Ensemble prediction does not match weighted sum.')
+
+    # 阶段 8：只评估集成模型，不分别导出 CatBoost / RF 的结果。
+    metrics, y_pred_test = evaluate_model(
+        ensemble_model, X_test_main, y_test_main
+    )
+    logger.info(
+        f'Ensemble independent test: MSE={metrics["Test_MSE"]:.4f}, '
+        f'MAE={metrics["Test_MAE"]:.4f}, R2={metrics["Test_R2"]:.4f}'
+    )
+
+    # 只有一份完整预测 CSV，使用 Dataset_Split 字段区分训练/测试。
+    # 训练样本为拟合内预测；测试样本才可用于独立性能评估。
+    y_pred_all = ensemble_model.predict(X_feats)
+    split_labels = np.full(len(data), 'Train', dtype=object)
+    split_labels[test_indices] = 'Test'
+
+    prediction_df = pd.DataFrame({
+        'Index': indices,
+        'Dataset_Split': split_labels,
+        'Sequence': data['Sequence'].to_numpy(),
+        'Cluster_ID': data['Cluster_ID'].to_numpy(),
+        'Cluster_Size': data['Cluster_Size'].to_numpy(),
+        'Replicate_Count': data['Replicate_Count'].to_numpy(),
+        'True_MIC_Standardized': y,
+        'Predicted_MIC_Standardized': y_pred_all
+    })
+    prediction_df['Residual'] = (
+        prediction_df['True_MIC_Standardized']
+        - prediction_df['Predicted_MIC_Standardized']
+    )
+    prediction_df.to_csv(
+        OUTPUT_DIR / 'mic_predictions.csv', index=False
+    )
+
+    # 保存一份融合后的特征重要性。先分别归一化两个模型的得分，
+    # 再按融合权重加权平均；该指标是描述性汇总，不是因果解释。
+    cb_importance = np.asarray(
+        trained_catboost.get_feature_importance(), dtype=float
+    )
+    rf_importance = np.asarray(
+        trained_forest.feature_importances_, dtype=float
+    )
+    cb_importance = np.maximum(cb_importance, 0.0)
+    rf_importance = np.maximum(rf_importance, 0.0)
+    cb_importance = cb_importance / max(cb_importance.sum(), 1e-12)
+    rf_importance = rf_importance / max(rf_importance.sum(), 1e-12)
+
+    fused_importance = (
+        catboost_weight * cb_importance
+        + forest_weight * rf_importance
+    )
+    feature_scores_df = pd.DataFrame({
+        'Feature_Name': feature_names,
+        'Importance_Score': fused_importance
+    }).sort_values('Importance_Score', ascending=False)
+    feature_scores_df.to_csv(
+        OUTPUT_DIR / 'feature_scores.csv', index=False
+    )
+
+    # 仅一行集成模型结果；子模型参数和融合权重记载于同一行。
+    results_df = pd.DataFrame([{
+        'Model': 'CatBoost_RandomForest_Ensemble',
+        'Ensemble_Method': 'OOF_Weighted_Average',
+        'CDHIT_Identity_Cutoff': CDHIT_THRESHOLD,
+        'CDHIT_Alignment_Coverage': CDHIT_COVERAGE,
+        'Raw_Observation_Count': raw_rows,
+        'Clean_Observation_Count': cleaned_rows,
+        'Exact_Unique_Sequences': n_exact_unique,
+        'Exact_Duplicate_Rows_Collapsed': cleaned_rows - n_exact_unique,
+        'Repeated_Sequence_Groups': n_replicate_groups,
+        'Different_MIC_Repeated_Sequence_Groups': n_conflicting_groups,
+        'CDHIT90_Removed_Sequences': n_near_duplicate_removed,
+        'Final_Unique_Representatives': n_after_cdhit,
+        'CatBoost_Weight': catboost_weight,
+        'RandomForest_Weight': forest_weight,
+        'CatBoost_Best_Params': str(best_param_sets['CatBoost']),
+        'RandomForest_Best_Params': str(best_param_sets['RandomForest']),
+        'Train_MSE_Mean': float(train_cv_errors.mean()),
+        'Train_MSE_Std': float(train_cv_errors.std()),
+        **metrics
+    }])
+    results_df.to_csv(OUTPUT_DIR / 'results.csv', index=False)
+
+    # 输出目录里只生成一个 .pkl，包含两个已经训练好的基模型和融合权重。
+    model_path = OUTPUT_DIR / 'CatBoost_RandomForest_ensemble.pkl'
+    joblib.dump(ensemble_model, model_path)
+
+    # 验证单个 pkl 可以独立加载并作出一致的预测。
+    restored_model = joblib.load(model_path)
+    if not np.allclose(
+        restored_model.predict(X_test_main), y_pred_test,
+        atol=1e-7, rtol=1e-7
+    ):
+        raise RuntimeError('Reloaded ensemble model predictions differ.')
+
+    plot_regression(
+        y_test_main, y_pred_test,
+        'CatBoost_RandomForest_Ensemble', OUTPUT_DIR
+    )
+    plot_residuals(
+        y_test_main, y_pred_test,
+        'CatBoost_RandomForest_Ensemble', OUTPUT_DIR
+    )
+    plot_ensemble_mse(train_cv_errors, metrics['Test_MSE'], OUTPUT_DIR)
+
+    logger.info(f'Single ensemble model saved to: {model_path}')
+    print(f'Single ensemble model saved to: {model_path}')
+
+    end_time_total = time.time()
+    total_training_time = end_time_total - start_total_time
+    logger.info(f"Protocol execution completed. Total computing time: {total_training_time:.2f} seconds")
+    print(f"Protocol execution completed. Total computing time: {total_training_time:.2f} seconds")
