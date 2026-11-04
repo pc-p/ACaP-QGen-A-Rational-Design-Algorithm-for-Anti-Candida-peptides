@@ -410,6 +410,9 @@ if __name__ == "__main__":
 
 ##ACaP-QPre
 import os
+import shutil
+import subprocess
+import tempfile
 import re
 import numpy as np
 import pandas as pd
@@ -430,12 +433,22 @@ from scipy.stats import pearsonr, spearmanr
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 
+# 使用 Kaggle Notebook 前，请先在单独的代码单元安装 CD-HIT：
+# !apt-get update -qq && apt-get install -y -qq cd-hit
+# 也可设置环境变量 CDHIT_BIN 指向已安装的 cd-hit 可执行文件。
+# 本脚本使用真实的 CD-HIT 程序；找不到时会报错，不会假装执行去冗余。
+
+CDHIT_THRESHOLD = 0.90
+CDHIT_WORD_SIZE = 5
+CDHIT_MIN_DISCARD_LENGTH = 4  # 原序列清洗允许最短 5 aa，避免默认 -l 10 丢弃短肽
+CDHIT_COVERAGE = 0.90          # 双向覆盖限制，避免仅共享短片段的肽被误聚类
+
 # 抑制特定环境警告以保持输出整洁
 warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', category=FutureWarning)
 
 # 初始化输出目录与日志记录系统
-OUTPUT_DIR = Path('/kaggle/working/MIC_prediction_outputs_ensemble')
+OUTPUT_DIR = Path('/kaggle/working/MIC_prediction_outputs_ensemble_cdhit90')
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 logger = logging.getLogger()
@@ -701,6 +714,185 @@ def make_fitted_voting_regressor(fitted_catboost, fitted_random_forest, weights)
     return ensemble
 
 
+def aggregate_exact_duplicate_sequences(data):
+    """
+    完全相同的清洗后氨基酸序列：MIC_Standardized 按算术平均合并。
+    不对仅相似的序列取均值；保留复测数量和活性范围供审查。
+    """
+    grouped = (
+        data.groupby('Sequence', as_index=False, sort=False)['MIC_Standardized']
+        .agg(
+            MIC_Standardized='mean',
+            Replicate_Count='size',
+            MIC_Min='min',
+            MIC_Max='max',
+            MIC_SD='std'
+        )
+    )
+    grouped['MIC_SD'] = grouped['MIC_SD'].fillna(0.0)
+    grouped['Length'] = grouped['Sequence'].str.len()
+    return grouped
+
+
+def parse_cdhit_clusters(cluster_file, expected_ids):
+    """严格读取 CD-HIT 的 .clstr 文件：映射每条序列到所属簇及代表序列。"""
+    groups = []
+    cluster_id = None
+    seen_ids = set()
+    reps_by_cluster = {}
+
+    for raw_line in cluster_file.read_text(encoding='utf-8').splitlines():
+        line = raw_line.strip()
+        if line.startswith('>Cluster '):
+            cluster_id = int(line.split()[-1])
+            continue
+        if not line:
+            continue
+        if cluster_id is None:
+            raise ValueError('CD-HIT .clstr contains a member before cluster header.')
+
+        member_match = re.search(r'>(seq\d+)\.\.\.', line)
+        if member_match is None:
+            raise ValueError(f'Unexpected CD-HIT .clstr member line: {line}')
+        member_id = member_match.group(1)
+        if member_id in seen_ids:
+            raise ValueError(f'Duplicate member ID in CD-HIT output: {member_id}')
+        seen_ids.add(member_id)
+
+        is_rep = line.endswith('*')
+        if is_rep:
+            if cluster_id in reps_by_cluster:
+                raise ValueError(f'Multiple representatives in cluster {cluster_id}')
+            reps_by_cluster[cluster_id] = member_id
+
+        groups.append({
+            'Member_ID': member_id,
+            'Cluster_ID': cluster_id,
+            'Is_Representative': is_rep
+        })
+
+    if seen_ids != set(expected_ids):
+        missing = set(expected_ids) - seen_ids
+        unexpected = seen_ids - set(expected_ids)
+        raise ValueError(
+            f'Incomplete CD-HIT cluster mapping: missing={len(missing)}, '
+            f'unexpected={len(unexpected)}.'
+        )
+    clusters = {row['Cluster_ID'] for row in groups}
+    if clusters != set(reps_by_cluster):
+        raise ValueError('CD-HIT output has one or more clusters without a representative.')
+    for item in groups:
+        item['Representative_ID'] = reps_by_cluster[item['Cluster_ID']]
+    return pd.DataFrame(groups)
+
+
+def run_cdhit_90(unique_data, output_dir):
+    """
+    对精确去重后的数据运行蛋白质 CD-HIT：90% identity。
+    .clstr 的代表序列保留其自身的 MIC 均值；近似序列不平均活性。
+    """
+    executable = os.environ.get('CDHIT_BIN', 'cd-hit')
+    resolved = shutil.which(executable)
+    if resolved is None:
+        raise FileNotFoundError(
+            "找不到 CD-HIT 可执行文件。请先在 Kaggle Notebook 单元执行 "
+            "'!apt-get update -qq && apt-get install -y -qq cd-hit'，"
+            "或者设置环境变量 CDHIT_BIN 为 cd-hit 的完整路径。"
+        )
+
+    unique_data = unique_data.reset_index(drop=True).copy()
+    unique_data['Member_ID'] = [
+        f'seq{idx:08d}' for idx in range(len(unique_data))
+    ]
+    expected_ids = unique_data['Member_ID'].tolist()
+    output_dir = Path(output_dir)
+
+    with tempfile.TemporaryDirectory(prefix='mic_cdhit90_') as temp_name:
+        work_dir = Path(temp_name)
+        fasta_in = work_dir / 'unique_peptides.fasta'
+        fasta_out = work_dir / 'cdhit90_representatives.fasta'
+
+        with fasta_in.open('w', encoding='utf-8') as handle:
+            for row in unique_data.itertuples(index=False):
+                handle.write(f'>{row.Member_ID}\n{row.Sequence}\n')
+
+        command = [
+            resolved,
+            '-i', str(fasta_in), '-o', str(fasta_out),
+            '-c', str(CDHIT_THRESHOLD), '-n', str(CDHIT_WORD_SIZE),
+            '-G', '1',
+            '-aL', str(CDHIT_COVERAGE), '-aS', str(CDHIT_COVERAGE),
+            '-l', str(CDHIT_MIN_DISCARD_LENGTH),
+            '-d', '0', '-M', '0', '-T', str(min(os.cpu_count() or 1, 4))
+        ]
+        logger.info('Running CD-HIT 90%%: %s', ' '.join(command))
+        try:
+            outcome = subprocess.run(
+                command, capture_output=True, text=True, check=True
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f'CD-HIT clustering failed (exit={exc.returncode}). '
+                f'stderr: {exc.stderr[-2000:]} '
+                f'stdout: {exc.stdout[-2000:]}'
+            ) from exc
+
+        logger.info('CD-HIT output: %s', outcome.stdout[-1200:])
+        clstr_path = Path(str(fasta_out) + '.clstr')
+        if not fasta_out.is_file() or not clstr_path.is_file():
+            raise FileNotFoundError('CD-HIT did not create representative FASTA and .clstr files.')
+
+        cluster_mapping = parse_cdhit_clusters(clstr_path, expected_ids)
+
+        # 同时核对 FASTA 的代表序列 ID，防止错误解析或短肽被静默过滤。
+        fasta_representatives = set(
+            re.findall(r'^>(\S+)', fasta_out.read_text(encoding='utf-8'), re.M)
+        )
+        clstr_representatives = set(
+            cluster_mapping.loc[
+                cluster_mapping['Is_Representative'], 'Member_ID'
+            ]
+        )
+        if fasta_representatives != clstr_representatives:
+            raise RuntimeError('CD-HIT FASTA and .clstr representative IDs differ.')
+
+    mapping = unique_data.merge(
+        cluster_mapping, how='inner', on='Member_ID', validate='one_to_one'
+    )
+    if len(mapping) != len(unique_data):
+        raise RuntimeError('CD-HIT mapping count does not match unique sequence count.')
+    id_to_sequence = dict(zip(unique_data['Member_ID'], unique_data['Sequence']))
+    mapping['Representative_Sequence'] = mapping['Representative_ID'].map(id_to_sequence)
+
+    # 仅选 CD-HIT 的代表序列，一簇保留一条记录。
+    representative_data = (
+        mapping.loc[mapping['Is_Representative']]
+        .sort_values('Cluster_ID')
+        .copy()
+    )
+    representative_data['Cluster_Size'] = (
+        representative_data['Cluster_ID']
+        .map(mapping.groupby('Cluster_ID').size())
+        .astype(int)
+    )
+    representative_data = representative_data[
+        ['Sequence', 'MIC_Standardized', 'Replicate_Count',
+         'MIC_Min', 'MIC_Max', 'MIC_SD', 'Length', 'Cluster_ID', 'Cluster_Size']
+    ].reset_index(drop=True)
+    mapping = mapping[
+        ['Member_ID', 'Cluster_ID', 'Sequence', 'MIC_Standardized',
+         'Replicate_Count', 'MIC_Min', 'MIC_Max', 'Is_Representative',
+         'Representative_Sequence']
+    ]
+
+    # 记录可复核的去冗余映射和最终建模数据。
+    mapping.to_csv(output_dir / 'cdhit90_cluster_mapping.csv', index=False)
+    representative_data.to_csv(
+        output_dir / 'cdhit90_modeling_dataset.csv', index=False
+    )
+    return representative_data, mapping
+
+
 # 主执行模块
 if __name__ == "__main__":
     start_total_time = time.time()
@@ -721,17 +913,55 @@ if __name__ == "__main__":
     if 'Sequence' not in data.columns or 'MIC_Standardized' not in data.columns:
         raise SystemExit("Input CSV must contain 'Sequence' and 'MIC_Standardized'.")
 
+    raw_rows = len(data)
     data['Sequence'] = data['Sequence'].apply(clean_sequence)
     data['MIC_Standardized'] = pd.to_numeric(
         data['MIC_Standardized'], errors='coerce'
     )
     data = data.dropna(subset=['Sequence', 'MIC_Standardized']).reset_index(drop=True)
     data = data[np.isfinite(data['MIC_Standardized'])].reset_index(drop=True)
-    if len(data) < 15:
-        raise ValueError('At least 15 valid samples are required for 10-fold CV.')
-    data['Length'] = data['Sequence'].apply(len)
-    logger.info(f'Clean dataset shape: {data.shape}')
+    cleaned_rows = len(data)
+    if cleaned_rows == 0:
+        raise ValueError('No valid MIC-labeled peptide sequences remain after cleaning.')
 
+    # 阶段 1A：完全相同序列（清洗后）合并；活性取算术均值。
+    unique_data = aggregate_exact_duplicate_sequences(data)
+    n_exact_unique = len(unique_data)
+    n_replicate_groups = int((unique_data['Replicate_Count'] > 1).sum())
+    n_conflicting_groups = int(
+        ((unique_data['Replicate_Count'] > 1) &
+         (unique_data['MIC_Max'] > unique_data['MIC_Min'])).sum()
+    )
+    logger.info(
+        f'Exact duplicate aggregation: {cleaned_rows} records -> '
+        f'{n_exact_unique} unique sequences; '
+        f'{n_replicate_groups} replicated sequence groups; '
+        f'{n_conflicting_groups} with differing MIC values.'
+    )
+
+    # 阶段 1B：先对全数据按序列聚类，再进行训练/测试划分。
+    # 仅以肽序列做 CD-HIT 去冗余，避免高度相似的序列同时进入两侧。
+    # 相似但不同的序列不合并 MIC；只保留簇代表序列自己的平均 MIC。
+    data, cdhit_mapping = run_cdhit_90(unique_data, OUTPUT_DIR)
+    n_after_cdhit = len(data)
+    n_near_duplicate_removed = n_exact_unique - n_after_cdhit
+    if n_after_cdhit < 15:
+        raise ValueError(
+            f'CD-HIT 0.90 reduced the dataset to {n_after_cdhit} sequences. '
+            'Need at least 15 samples to run the existing 10-fold CV pipeline.'
+        )
+
+    logger.info(
+        f'CD-HIT 0.90: {n_exact_unique} unique sequences -> '
+        f'{n_after_cdhit} representative peptides '
+        f'({n_near_duplicate_removed} near-duplicate sequences removed).'
+    )
+    print(
+        f'Deduplication: raw={raw_rows}, valid={cleaned_rows}, '
+        f'exact_unique={n_exact_unique}, CDHIT90={n_after_cdhit}'
+    )
+
+    # 绘图反映实际参与建模的 CD-HIT 代表序列，不再用去冗余前的数据。
     plt.figure(figsize=(8, 6))
     plt.hist(data['MIC_Standardized'], bins=30)
     plt.title('Distribution of MIC_Standardized')
@@ -968,6 +1198,10 @@ if __name__ == "__main__":
     ensemble_model.feature_names_ = feature_names
     ensemble_model.aaindex_features_ = aa_features_dict
     ensemble_model.target_clip_bounds_ = (float(q_low), float(q_high))
+    ensemble_model.cdhit_threshold_ = CDHIT_THRESHOLD
+    ensemble_model.cdhit_alignment_coverage_ = CDHIT_COVERAGE
+    ensemble_model.duplicate_target_aggregation_ = 'mean'
+    ensemble_model.training_sequence_count_ = len(train_indices)
 
     # 验证 VotingRegressor 的预测与人工加权求和一致。
     prediction_check = (
@@ -999,6 +1233,9 @@ if __name__ == "__main__":
         'Index': indices,
         'Dataset_Split': split_labels,
         'Sequence': data['Sequence'].to_numpy(),
+        'Cluster_ID': data['Cluster_ID'].to_numpy(),
+        'Cluster_Size': data['Cluster_Size'].to_numpy(),
+        'Replicate_Count': data['Replicate_Count'].to_numpy(),
         'True_MIC_Standardized': y,
         'Predicted_MIC_Standardized': y_pred_all
     })
@@ -1039,6 +1276,16 @@ if __name__ == "__main__":
     results_df = pd.DataFrame([{
         'Model': 'CatBoost_RandomForest_Ensemble',
         'Ensemble_Method': 'OOF_Weighted_Average',
+        'CDHIT_Identity_Cutoff': CDHIT_THRESHOLD,
+        'CDHIT_Alignment_Coverage': CDHIT_COVERAGE,
+        'Raw_Observation_Count': raw_rows,
+        'Clean_Observation_Count': cleaned_rows,
+        'Exact_Unique_Sequences': n_exact_unique,
+        'Exact_Duplicate_Rows_Collapsed': cleaned_rows - n_exact_unique,
+        'Repeated_Sequence_Groups': n_replicate_groups,
+        'Different_MIC_Repeated_Sequence_Groups': n_conflicting_groups,
+        'CDHIT90_Removed_Sequences': n_near_duplicate_removed,
+        'Final_Unique_Representatives': n_after_cdhit,
         'CatBoost_Weight': catboost_weight,
         'RandomForest_Weight': forest_weight,
         'CatBoost_Best_Params': str(best_param_sets['CatBoost']),
@@ -1078,5 +1325,3 @@ if __name__ == "__main__":
     total_training_time = end_time_total - start_total_time
     logger.info(f"Protocol execution completed. Total computing time: {total_training_time:.2f} seconds")
     print(f"Protocol execution completed. Total computing time: {total_training_time:.2f} seconds")
-    print(f"Protocol execution completed. Total computing time: {total_training_time:.2f} seconds")rt_total_time
-    print(f"Ablation Study completed safely. Total computing time: {total_training_time:.2f} seconds")
